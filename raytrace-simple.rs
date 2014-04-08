@@ -124,7 +124,8 @@ impl Intersect for Halfspace {
   fn intersect(&self, ray: &Ray) -> Option<f32> {
     let v = ray.vector.dot(&self.normal);
     if v != 0.0 {
-      Some( 1.0 / -v )
+      //Some( 1.0 / -v )
+      Some( (self.point - ray.point).dot(&self.normal) / v)
     } else {
       None
     }
@@ -169,7 +170,8 @@ impl<'a> PpmCanvas<'a> {
 
   fn plot(&mut self, x: uint, y: uint, r: f32, g: f32, b: f32) {
     use std::cmp::{max,min};
-    let i = ((self.height - y - 1) * self.width + x) * 3;
+    //let i = ((self.height - y - 1) * self.width + x) * 3;
+    let i = (y * self.width + x) * 3;
     *self.bytes.get_mut(i  ) = max(0, min(255, (r * 255.0) as u8));
     *self.bytes.get_mut(i+1) = max(0, min(255, (g * 255.0) as u8));
     *self.bytes.get_mut(i+2) = max(0, min(255, (b * 255.0) as u8));
@@ -184,23 +186,6 @@ impl<'a> PpmCanvas<'a> {
   }
 }
 
-fn firstIntersection<A,B,T: Iterator<(A,Option<f32>,B)>>(intersections: T) -> Option<(A,f32,B)> {
-  use std::f32;
-  let mut intersections = intersections;
-  let mut numResult = f32::MAX_VALUE as f32;
-  let mut result = None;
-  for (a,f,b) in intersections {
-    match f {
-      Some(x) if x > -EPSILON && x < numResult => {
-        numResult = x;
-        result = Some((a,x,b));
-      }
-      _ => {},
-    };
-  }
-  result
-}
-
 struct Scene {
   objects: Vec<(~Intersect,~Surface)>,
   lights: Vec<Light>,
@@ -208,6 +193,7 @@ struct Scene {
   lookingAt: Vector,
   fieldOfView: f32,
   recursionDepth: Cell<uint>,
+  recursionLimit: uint,
 }
 
 impl Scene {
@@ -219,6 +205,7 @@ impl Scene {
       lookingAt: VZERO,
       fieldOfView: 45.0,
       recursionDepth: Cell::new(0),
+      recursionLimit: 3
     }
   }
 
@@ -238,7 +225,7 @@ impl Scene {
     use std::f32::consts::PI;
     let fovRadians = PI * (self.fieldOfView / 2.0) / 180.0;
     let halfWidth = fovRadians.tan();
-    let halfHeight = 0.75 * halfWidth;
+    let halfHeight = halfWidth;
     let width = halfWidth * 2.0;
     let height = halfHeight * 2.0;
     let pixelWidth = width / (canvas.width as f32 - 1.0);
@@ -248,14 +235,7 @@ impl Scene {
     let vpRight = eye.vector.cross(&VUP).normalized();
     let vpUp = vpRight.cross(&eye.vector).normalized();
 
-    let mut previousFraction = 0.0;
-
     for y in range(0, canvas.height) {
-      let currentFraction = (y as f32) / (canvas.height as f32);
-      if currentFraction - previousFraction > 0.05 {
-        canvas.save();
-        previousFraction = currentFraction;
-      }
       for x in range(0, canvas.width) {
         let xcomp = vpRight.scale(x as f32 * pixelWidth - halfWidth);
         let ycomp = vpUp.scale(y as f32 * pixelHeight - halfHeight);
@@ -264,19 +244,28 @@ impl Scene {
         canvas.plot(x,y,color.x,color.y,color.z);
       }
     }
+    canvas.save();
   }
 
   fn rayColour(&self, ray: &Ray) -> Color {
-    if self.recursionDepth.get() > 3 {
+    use std::f32;
+    if self.recursionDepth.get() > self.recursionLimit {
       VZERO
     } else {
       self.recursionDepth.set(self.recursionDepth.get() + 1);
-      let intersections = self.objects.iter().map(|&(ref o, ref s)| {
-        let i = o.intersect(ray);
-        (o,i,s)
-      });
-      let i = firstIntersection(intersections);
-      let result = match i {
+
+      let mut minT = f32::MAX_VALUE as f32;
+      let mut minO = None;
+      for &(ref obj, ref s) in self.objects.iter() {
+        match obj.intersect(ray) {
+          Some(t) if (t > -EPSILON && t < minT) => {
+            minT = t;
+            minO = Some((obj,t,s))
+          },
+          _ => {}
+        }
+      }
+      let result = match minO {
         None => VZERO,
         Some((o, t, s)) => {
           let p = ray.pointAtTime(t);
@@ -289,15 +278,24 @@ impl Scene {
   }
 
   fn lightIsVisible(&self, l: &Light, p: &Vector) -> bool {
+    let ray = Ray::new(*p,l-(*p));
+    let length = (*l-*p).magnitude();
     for &(ref o, _) in self.objects.iter() {
-      let t = o.intersect(&Ray::new(*p,l-(*p)));
-      return t.map_or(true, |t| t <= EPSILON);
+      let t = o.intersect(&ray);
+      match t {
+        Some(f) if f > EPSILON && f < length - EPSILON => {
+          return false;
+        },
+        _ => {}
+      }
+      //return t.map_or(true, |t| t <= EPSILON);
     }
     true
   }
 
   fn visibleLights(&self, p: &Vector) -> Vec<Light> {
-    self.lights.iter().filter(|&l| self.lightIsVisible(l,p))
+    self.lights.iter()
+      .filter(|&l| self.lightIsVisible(l,p))
       .map(|l|*l).collect()
   }
 }
@@ -319,6 +317,7 @@ struct SimpleSurface {
 trait Surface {
   fn baseColourAt(&self, p: &Vector) -> Color;
   fn colourAt(&self, scene: &Scene, ray: &Ray, p: &Vector , normal: &Vector) -> Color {
+    use std::f32::abs;
     let b = self.baseColourAt(p);
     let mut c = Vector::new(0.0, 0.0, 0.0);
     if self.getSpecular() > 0.0 {
@@ -329,12 +328,11 @@ trait Surface {
     if self.getLambert() > 0.0 {
       let mut lambertAmount = 0.0;
       for lightPoint in scene.visibleLights(p).iter() {
-        let contribution = (lightPoint - *p).normalized().dot(normal);
-        if contribution > 0.0 {
-          lambertAmount = lambertAmount + contribution;
-        }
+        let d = *p - *lightPoint;
+        let dLength = d.magnitude();
+        let contribution = abs(d.dot(normal) / (dLength * dLength));
+        lambertAmount = lambertAmount + contribution;
       }
-      lambertAmount = 1f32.min(lambertAmount);
       c = addColours(c, self.getLambert() * lambertAmount, b)
     }
     if self.getAmbient() > 0.0 {
@@ -350,7 +348,10 @@ trait Surface {
 }
 
 impl SimpleSurface {
-  fn new(baseColour: Color, specularCoefficient: f32, lambertCoefficient: f32) -> SimpleSurface {
+  fn new(baseColour: Color) -> SimpleSurface {
+    SimpleSurface::advancedNew(baseColour, 0.3, 0.6)
+  }
+  fn advancedNew(baseColour: Color, specularCoefficient: f32, lambertCoefficient: f32) -> SimpleSurface {
     SimpleSurface {
       baseColour: baseColour,
       specularCoefficient: specularCoefficient,
@@ -380,7 +381,10 @@ struct CheckerboardSurface {
 }
 
 impl CheckerboardSurface {
-  fn new(baseColour: Color, otherColour: Color, checkSize: f32, specularCoefficient: f32,
+  fn new(baseColour: Color, otherColour: Color, checkSize: f32) -> CheckerboardSurface {
+    CheckerboardSurface::advancedNew(baseColour, otherColour, checkSize, 0.3, 0.6)
+  }
+  fn advancedNew(baseColour: Color, otherColour: Color, checkSize: f32, specularCoefficient: f32,
         lambertCoefficient: f32) -> CheckerboardSurface {
     CheckerboardSurface {
       baseColour: baseColour,
@@ -395,9 +399,12 @@ impl CheckerboardSurface {
 
 impl Surface for CheckerboardSurface {
   fn baseColourAt(&self, p: &Vector) -> Color {
-    use std::num::{abs,Round};
     let v = (p - VZERO).scale(1.0 / self.checkSize);
-    if (abs(v.x).round() + abs(v.y).round() + abs(v.z).round()) as uint % 2 != 0 {
+    fn f(x:f32) -> uint {
+      use std::num::{abs,Round};
+      (abs(x) + 0.5).floor() as uint
+    }
+    if (f(v.x) + f(v.y) + f(v.z)) % 2 == 1 {
       self.otherColour
     } else {
       self.baseColour
@@ -411,27 +418,93 @@ impl Surface for CheckerboardSurface {
   }
 }
 
+fn coolScene() -> Scene {
+  use std::f32::consts::PI;
+  let mut s = Scene::new();
+  for i in range(0,10) {
+    let i = i as f32;
+    let theta = i * (i+5.0) * PI / 100.0 + 0.3;
+    let center = Vector::new(0.0 - 4.0 * theta.sin(), 1.5 - i / 2.0, 0.0 - 4.0 * theta.cos());
+    let form = Sphere::new(center, 0.3 + i * 0.1);
+    let surface = SimpleSurface::new(Vector::new(i / 6.0, 1.0 - i/6.0, 0.5));
+    s.addObject(box form, box surface);
+  }
+  s.addObject(
+    box Sphere::new(VZERO, 2.0),
+    box SimpleSurface::new(Vector::new(1.0,1.0,1.0))
+  );
+  s.addObject(
+    box Halfspace::new(Vector::new(0.0,4.0,0.0),Vector::new(0.0,1.0,0.0)),
+    box CheckerboardSurface::new(Vector::new(1.0,1.0,1.0),VZERO,1.0)
+  );
+  s.addObject(
+    box Halfspace::new(Vector::new(0.0,-4.0,0.0),Vector::new(0.0,1.0,0.0)),
+    box SimpleSurface::new(Vector::new(0.9,1.0,1.0))
+  );
+  s.addObject(
+    box Halfspace::new(Vector::new(6.0,0.0,0.0),Vector::new(1.0,0.0,0.0)),
+    box SimpleSurface::new(Vector::new(1.0,0.9,1.0))
+  );
+  s.addObject(
+    box Halfspace::new(Vector::new(-6.0,0.0,0.0),Vector::new(1.0,0.0,0.0)),
+    box SimpleSurface::new(Vector::new(1.0,1.0,0.9))
+  );
+  s.addObject(
+    box Halfspace::new(Vector::new(0.0,0.0,6.0),Vector::new(0.0,0.0,1.0)),
+    box SimpleSurface::new(Vector::new(0.9,0.9,1.0))
+  );
+  s.addLight(
+    Vector::new(0.0,-3.0,0.0)
+  );
+  s.addLight(
+    Vector::new(3.0,3.0,0.0)
+  );
+  s.addLight(
+    Vector::new(-3.0,3.0,0.0)
+  );
+  s.position = Vector::new(0.0,0.0,-15.0);
+  s.lookingAt = Vector::new(0.0,0.0,0.0);
+  s.fieldOfView = 45.0;
+  s.recursionLimit = 5;
+  s
+}
 
-fn main() {
-  let mut canvas = PpmCanvas::new(1600,1200,"test_raytrace_rust.ppm");
+fn normalScene() -> Scene {
   let mut s = Scene::new();
   s.addLight(Vector::new(30.0, 30.0, 10.0));
   s.addLight(Vector::new(-10.0, 100.0, 30.0));
   s.lookAt(Vector::new(0.0, 3.0, 0.0));
   s.addObject(
     box Sphere::new(Vector::new(1.0,3.0,-10.0), 2.0),
-    box SimpleSurface::new(Vector::new(1.0, 1.0, 0.0), 0.2, 0.6)
+    box SimpleSurface::new(Vector::new(1.0, 1.0, 0.0))
   );
   for x in range(0,6) {
     let y = x as f32;
     s.addObject(
       box Sphere::new(Vector::new(-3.0-y*0.4, 2.3, -5.0), 0.4),
-      box SimpleSurface::new(Vector::new(y/6.0, 1.0-y/6.0, 0.5),0.2,0.6)
+      box SimpleSurface::new(Vector::new(y/6.0, 1.0-y/6.0, 0.5))
     );
   }
   s.addObject(
     box Halfspace::new(VZERO, VUP),
-    box CheckerboardSurface::new(Vector::new(1.0,1.0,1.0), VZERO, 1.0, 0.2, 0.6)
+    box CheckerboardSurface::new(Vector::new(1.0,1.0,1.0), VZERO, 1.0)
   );
+  s
+}
+
+fn main() {
+  let mut canvas = PpmCanvas::new(800,800,"test_raytrace_rust.ppm");
+
+  let mut s = coolScene();
   s.render(&mut canvas);
+  /*for a in range(-2,2) {
+    for b in range(-2,2) {
+      for c in range(-2,2) {
+        let name = format!("test_raytrace_rust_{}_{}_{}.ppm",a,b,c);
+        let mut canv = PpmCanvas::new(800,600,name);
+        s.position = Vector::new(a as f32, b as f32, c as f32);
+        s.render(&mut canv);
+      }
+    }
+  }*/
 }
